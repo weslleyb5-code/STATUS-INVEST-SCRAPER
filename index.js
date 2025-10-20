@@ -1,12 +1,9 @@
-// index.js - usa window.fetch dentro do contexto do browser para chamar o endpoint
-// ==================================================
-// Fluxo:
-// 1) Abre a página para obter cookies/contexto.
-// 2) Executa window.fetch (via page.evaluate) para o endpoint advancedsearchresultpaginated,
-//    paginando até o fim.
-// 3) Se não funcionar, tenta fallback via DOM.
-// 4) Limpa a aba SHEET_TAB e grava os dados.
-// ==================================================
+// index.js (usa PLAYWRIGHT_STORAGE se disponível)
+// ------------------------------------------------
+// Lê PLAYWRIGHT_STORAGE (JSON cru ou base64); cria contexto com storageState.
+// Faz window.fetch para endpoint advancedsearchresultpaginated (paginação).
+// Se tudo ok, grava (substitui) a aba SHEET_TAB na planilha definida.
+// ------------------------------------------------
 
 const { chromium } = require('playwright');
 const { google } = require('googleapis');
@@ -112,7 +109,44 @@ function buildSearchJsonForTake(take) {
   return JSON.stringify(template);
 }
 
-// Faz fetch dentro do contexto da página (window.fetch) — contorna proteção que bloqueia requisições server-side
+// cria browser/context usando PLAYWRIGHT_STORAGE (JSON cru ou base64)
+// retorna { browser, context, page }
+async function createBrowserAndPageWithStorage() {
+  const browser = await chromium.launch({
+    args: ['--no-sandbox', '--disable-setuid-sandbox'],
+    headless: true
+  });
+
+  let context;
+  const raw = process.env.PLAYWRIGHT_STORAGE;
+  if (raw) {
+    try {
+      // tenta decodificar base64 primeiro
+      let parsed = null;
+      try {
+        const maybe = Buffer.from(raw, 'base64').toString('utf8');
+        parsed = JSON.parse(maybe);
+        console.log('PLAYWRIGHT_STORAGE lido como base64(JSON).');
+      } catch (_) {
+        // não era base64 -> tenta JSON cru
+        parsed = JSON.parse(raw);
+        console.log('PLAYWRIGHT_STORAGE lido como JSON cru.');
+      }
+      context = await browser.newContext({ storageState: parsed });
+    } catch (e) {
+      console.warn('PLAYWRIGHT_STORAGE inválido — criando contexto limpo:', e.message || e);
+      context = await browser.newContext();
+    }
+  } else {
+    context = await browser.newContext();
+    console.log('PLAYWRIGHT_STORAGE não fornecido — contexto limpo criado.');
+  }
+
+  const page = await context.newPage();
+  return { browser, context, page };
+}
+
+// Faz fetch dentro do contexto do browser (window.fetch) e pagina
 async function fetchViaWindowFetch(page) {
   const base = 'https://statusinvest.com.br/category/advancedsearchresultpaginated';
   const take = 100;
@@ -126,7 +160,6 @@ async function fetchViaWindowFetch(page) {
     const fetchUrl = `${base}?search=${searchParam}&orderColumn=&isAsc=&page=${pageIndex}&take=${take}&CategoryType=2`;
     console.log(`(browser) fetch page ${pageIndex} -> ${fetchUrl}`);
 
-    // Executa fetch no contexto do browser (mesmo site origin, com cookies e tokens JS)
     const resp = await page.evaluate(async (url) => {
       try {
         const r = await fetch(url, {
@@ -139,7 +172,6 @@ async function fetchViaWindowFetch(page) {
         });
         const status = r.status;
         const text = await r.text();
-        // tenta parse
         try {
           const json = JSON.parse(text);
           return { ok: true, status, json };
@@ -198,7 +230,6 @@ async function tryAcceptCookiesAndCloseModals(page) {
     try {
       const el = page.locator(sel);
       if (await el.count() > 0) {
-        console.log('Clicando botão de cookie/modal:', sel);
         await el.first().click({ timeout: 3000 }).catch(()=>{});
       }
     } catch(e){ /* ignore */ }
@@ -207,35 +238,25 @@ async function tryAcceptCookiesAndCloseModals(page) {
 
 async function scrapeStatusInvest() {
   const url = 'https://statusinvest.com.br/fundos-imobiliarios/busca-avancada';
-  const browser = await chromium.launch({
-    args: ['--no-sandbox', '--disable-setuid-sandbox'],
-    headless: true
-  });
-  const page = await browser.newPage();
+  const { browser, page } = await createBrowserAndPageWithStorage();
 
   console.log('Abrindo página para obter contexto (cookies/JS)...', url);
   await page.goto(url, { waitUntil: 'networkidle' }).catch(()=>{});
 
-  // aguarda um pouco para eventuais JS de proteção rodarem (Cloudflare/anti-bot)
+  // espera um pouco para eventuais JS de proteção
   await page.waitForTimeout(1200);
-
   await tryAcceptCookiesAndCloseModals(page);
 
-  // tenta clicar Buscar (se existir)
+  // tenta clicar buscar (não obrigatório)
   try {
     const buscarLoc = page.locator('xpath=//button[contains(translate(normalize-space(string(.)),"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz"), "buscar")]');
     if (await buscarLoc.count() > 0) {
-      console.log('Clicando botão Buscar (se existir)...');
       await buscarLoc.first().click().catch(()=>{});
       await page.waitForTimeout(600);
-    } else {
-      console.log('Botão Buscar não encontrado — vamos tentar a API via window.fetch.');
     }
-  } catch (e) {
-    console.warn('Erro ao tentar clicar Buscar:', e.message || e);
-  }
+  } catch(e){}
 
-  // TENTATIVA PRINCIPAL: usar window.fetch no contexto do browser
+  // principal: window.fetch via page.evaluate (usa cookies do contexto)
   let apiResult = null;
   try {
     apiResult = await fetchViaWindowFetch(page);
@@ -317,7 +338,6 @@ async function scrapeStatusInvest() {
   return res;
 }
 
-// Execução principal
 (async () => {
   try {
     console.log('Iniciando scraping e envio ao Google Sheets...');
