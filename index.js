@@ -1,5 +1,10 @@
 // index.js
 // RODAR: node index.js
+// ==================================================
+// Script: abre StatusInvest (busca avançada de FIIs), clica em "Buscar",
+// captura resultados e sobrescreve a aba especificada na Google Sheets.
+// ==================================================
+
 const { chromium } = require('playwright');
 const { google } = require('googleapis');
 
@@ -8,23 +13,22 @@ async function getServiceAccount() {
   if (!raw) throw new Error('Env GOOGLE_CREDENTIALS não configurado');
   try {
     if (raw.trim().startsWith('{')) return JSON.parse(raw);
-    // assume base64
     return JSON.parse(Buffer.from(raw, 'base64').toString('utf8'));
   } catch (err) {
-    throw new Error('Não foi possível ler GOOGLE_CREDENTIALS (esperado JSON ou base64(JSON)):' + err.message);
+    throw new Error('Não foi possível ler GOOGLE_CREDENTIALS (esperado JSON ou base64(JSON)): ' + err.message);
   }
 }
 
 function normalizeRows(rows) {
-  // transforma arrays de colunas para valores aceitos pelo Sheets API
   return rows.map(r => {
     if (Array.isArray(r)) return r.map(c => (c === null || c === undefined) ? '' : String(c));
     return [String(r)];
   });
 }
 
-async function appendToSheet(values) {
+async function writeFreshToSheet(valuesWithHeader) {
   const spreadsheetId = process.env.SHEET_ID;
+  const tab = process.env.SHEET_TAB || 'Sheet1';
   if (!spreadsheetId) throw new Error('Env SHEET_ID não configurado');
 
   const serviceAccount = await getServiceAccount();
@@ -36,12 +40,23 @@ async function appendToSheet(values) {
   );
   const sheets = google.sheets({ version: 'v4', auth: client });
 
-  // append at Sheet1, adjust range if necessário
-  const res = await sheets.spreadsheets.values.append({
+  // limpa a aba inteira (range por nome da aba)
+  console.log(`Limpando aba "${tab}" da planilha ${spreadsheetId}...`);
+  await sheets.spreadsheets.values.clear({
     spreadsheetId,
-    range: 'Sheet1!A1',
+    range: `${tab}`
+  }).catch(err => {
+    // Em alguns casos range vazio pode dar erro se aba não existir
+    console.warn('Aviso ao limpar aba:', err.message || err);
+  });
+
+  // escreve os valores a partir de A1
+  console.log(`Escrevendo ${valuesWithHeader.length} linhas em ${tab}...`);
+  const res = await sheets.spreadsheets.values.update({
+    spreadsheetId,
+    range: `${tab}!A1`,
     valueInputOption: 'RAW',
-    requestBody: { values }
+    requestBody: { values: valuesWithHeader }
   });
   return res.data;
 }
@@ -54,10 +69,10 @@ async function scrapeStatusInvest() {
   });
   const page = await browser.newPage();
 
-  console.log('Abrindo página...');
+  console.log('Abrindo página...', url);
   await page.goto(url, { waitUntil: 'networkidle' });
 
-  // tenta localizar e clicar no botão "Buscar" de formas alternativas
+  // tenta localizar e clicar no botão "Buscar"
   const buscarSelectors = [
     'button:has-text("Buscar")',
     'button:has-text("BUSCAR")',
@@ -80,74 +95,110 @@ async function scrapeStatusInvest() {
     }
   }
   if (!clicked) {
-    console.warn('Não achou botão Buscar — continuando sem clicar (talvez resultados já estejam visíveis).');
+    console.warn('Não achou botão Buscar — continuando (talvez resultados já estejam visíveis).');
   }
 
-  // espera por mudança no DOM (área "Resultado da busca") ou por respostas de rede
+  // Espera um pouco para o resultado carregar (tenta por seletor de tabela ou por rede)
   try {
-    await page.waitForSelector('text=Resultado da busca', { timeout: 12_000 });
+    await page.waitForSelector('table, .list-item, [role="row"]', { timeout: 12_000 });
   } catch (e) {
-    console.log('Aviso: header "Resultado da busca" não apareceu rapidamente, continuando...');
+    console.log('Aviso: resultados não detectados rapidamente, continuando mesmo assim...');
   }
 
-  // tenta capturar os dados de várias formas (tabelas, linhas, cards)
-  const rows = await page.evaluate(() => {
-    // 1) se houver tabela, pega todas as linhas
-    const tableRows = Array.from(document.querySelectorAll('table tbody tr'));
-    if (tableRows.length > 0) {
-      return tableRows.map(tr => Array.from(tr.querySelectorAll('th,td')).map(td => td.innerText.trim()));
+  // Avalia a página e tenta extrair header + linhas (de forma robusta)
+  const extracted = await page.evaluate(() => {
+    function textOf(el) {
+      return el ? el.innerText.trim().replace(/\s+/g, ' ') : '';
     }
 
-    // 2) procura por elementos com aparência de "linha" (role=row)
+    // Caso 1: tabela HTML com thead + tbody
+    const table = document.querySelector('table');
+    if (table) {
+      // header
+      const headerEls = Array.from(table.querySelectorAll('thead th'));
+      let header = headerEls.length ? headerEls.map(h => textOf(h)) : [];
+      // linhas
+      const bodyRows = Array.from(table.querySelectorAll('tbody tr'));
+      const rows = bodyRows.map(tr => Array.from(tr.querySelectorAll('th,td')).map(td => textOf(td)));
+      // Se não há thead, tente extrair header da primeira linha se tiver th
+      if (!header.length) {
+        const firstThs = Array.from(table.querySelectorAll('tr:first-child th'));
+        if (firstThs.length) header = firstThs.map(h => textOf(h));
+      }
+      return { header, rows };
+    }
+
+    // Caso 2: linhas com role=row
     const roleRows = Array.from(document.querySelectorAll('[role="row"]'));
-    if (roleRows.length > 0) {
-      return roleRows.map(r => {
-        const cols = Array.from(r.querySelectorAll('[role="cell"],div,span'));
-        return cols.map(c => c.innerText.trim()).filter(Boolean);
+    if (roleRows.length) {
+      // tenta extrair header de elementos com role=columnheader
+      const headerEls = Array.from(document.querySelectorAll('[role="columnheader"]'));
+      const header = headerEls.length ? headerEls.map(h => textOf(h)) : [];
+      const rows = roleRows.map(r => {
+        const cells = Array.from(r.querySelectorAll('[role="cell"],div,span')).map(c => textOf(c)).filter(Boolean);
+        return cells;
       }).filter(r => r.length > 0);
+      return { header, rows };
     }
 
-    // 3) cartões / lista — pega títulos + parágrafo
-    const cardSelectors = ['.list-item', '.result-item', '.card', '.asset-card'];
+    // Caso 3: cartões / lista (captura textos dos itens)
+    const cardSelectors = ['.list-item', '.result-item', '.card', '.asset-card', '.fund-card'];
     for (const sel of cardSelectors) {
       const cards = Array.from(document.querySelectorAll(sel));
-      if (cards.length > 0) return cards.map(c => [c.innerText.replace(/\s+/g, ' ').trim()]);
-    }
-
-    // 4) fallback: pega o texto logo após o título "Resultado da busca"
-    const header = Array.from(document.querySelectorAll('*')).find(el => el.textContent && el.textContent.includes('Resultado da busca'));
-    if (header) {
-      let sibling = header.nextElementSibling || header.parentElement;
-      if (sibling) {
-        const lines = sibling.innerText.split('\n').map(l => l.trim()).filter(Boolean);
-        // transforma linhas em arrays single-coluna
-        return lines.map(l => [l]);
+      if (cards.length) {
+        const rows = cards.map(c => {
+          // tenta extrair título e subinfo
+          const title = c.querySelector('h2, h3, .title, .name') ? (c.querySelector('h2, h3, .title, .name').innerText || '').trim() : '';
+          const txt = c.innerText.replace(/\s+/g, ' ').trim();
+          return [title || txt];
+        });
+        return { header: ['raw_text'], rows };
       }
     }
 
-    // 5) se nada deu, retorna vazio
-    return [];
+    // Caso 4: fallback — captura linhas de texto perto do título "Resultado da busca"
+    const headerEl = Array.from(document.querySelectorAll('*')).find(el => el.textContent && el.textContent.includes('Resultado da busca'));
+    if (headerEl) {
+      let sibling = headerEl.nextElementSibling || headerEl.parentElement;
+      if (sibling) {
+        const lines = sibling.innerText.split('\n').map(l => l.trim()).filter(Boolean);
+        const rows = lines.map(l => [l]);
+        return { header: ['raw_text'], rows };
+      }
+    }
+
+    // default: vazio
+    return { header: [], rows: [] };
   });
 
-  console.log('Linhas capturadas (amostra):', rows.slice(0, 5));
   await browser.close();
 
+  const { header, rows } = extracted;
+  console.log('Header detectado:', header);
+  console.log('Quantidade de linhas capturadas:', rows.length);
+
   if (!rows || rows.length === 0) {
-    throw new Error('Nenhuma linha capturada — pode ser que o site tenha carregado dinamicamente com outra rota. Verifique manualmente no navegador as classes/estrutura.');
+    throw new Error('Nenhuma linha capturada — verifique manualmente a estrutura do site ou os logs do workflow.');
   }
 
-  // normaliza e envia ao Sheets
-  const values = normalizeRows(rows);
-  const res = await appendToSheet(values);
+  // Prepara valores a enviar: se houve header não vazio, coloca header como primeira linha.
+  const normalizedRows = normalizeRows(rows);
+  const valuesToWrite = (header && header.length)
+    ? [header, ...normalizedRows]
+    : normalizedRows; // se sem header, grava apenas rows
+
+  // escreve tudo na planilha (limpa antes)
+  const res = await writeFreshToSheet(valuesToWrite);
   return res;
 }
 
-// Execução
+// Execução principal
 (async () => {
   try {
     console.log('Iniciando scraping e envio ao Google Sheets...');
     const result = await scrapeStatusInvest();
     console.log('Sucesso! Resultado da API do Sheets:', JSON.stringify(result, null, 2));
+    process.exit(0);
   } catch (err) {
     console.error('Erro:', err && err.message ? err.message : err);
     process.exit(1);
