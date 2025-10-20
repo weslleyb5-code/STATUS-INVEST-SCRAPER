@@ -1,0 +1,13 @@
+{
+  "name": "statusinvest-fiis-scraper",
+  "version": "1.0.0",
+  "description": "Scraper de busca avançada de FIIs (StatusInvest) -> Google Sheets",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "googleapis": "^126.0.0",
+    "playwright": "^1.42.0"
+  }
+}
