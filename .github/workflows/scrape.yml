@@ -29,4 +29,5 @@ jobs:
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
           SHEET_ID: ${{ secrets.SHEET_ID }}
           SHEET_TAB: ${{ secrets.SHEET_TAB }}
+          PLAYWRIGHT_STORAGE: ${{ secrets.PLAYWRIGHT_STORAGE }}
         run: node index.js
